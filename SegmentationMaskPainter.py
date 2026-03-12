@@ -142,7 +142,9 @@ DEFAULT_TARGETS = [
 # =========================================================
 def get_appdata_dir():
     # 実行ファイルまたはスクリプトのあるディレクトリを使用
-    path = os.path.dirname(sys.argv[0])
+    path = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if not path:
+        path = os.getcwd()
     os.makedirs(path, exist_ok=True)
     return path
 
