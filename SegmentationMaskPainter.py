@@ -121,7 +121,8 @@ CLASS_DATA = [
     ("画面（スクリーン）", "screen"), ("毛布", "blanket"), ("彫刻", "sculpture"), ("フード（換気フード）", "hood"), ("壁灯（ブラケット）", "sconce"),
     ("花瓶", "vase"), ("信号機", "traffic light"), ("トレイ", "tray"), ("ごみ箱", "ashcan"), ("扇風機", "fan"),
     ("桟橋", "pier"), ("CRT画面（ブラウン管）", "crt screen"), ("皿", "plate"), ("モニター", "monitor"), ("掲示板", "bulletin board"),
-    ("シャワー", "shower"), ("ラジエーター（暖房器）", "radiator"), ("ガラス", "glass"), ("時計", "clock"), ("旗", "flag")
+    ("シャワー", "shower"), ("ラジエーター（暖房器）", "radiator"), ("ガラス", "glass"), ("時計", "clock"), ("旗", "flag"),
+    ("人の影", "shadow")
 ]
 
 # =========================================================
@@ -230,14 +231,13 @@ def load_model(inf_short, inf_long):
 
 
 def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, save_format,
-                       bw_mode=False, shadow_mode=False, shadow_threshold=100):
+                       bw_mode=False, shadow_threshold=100):
     """
     セグメンテーション処理
 
     Args:
         bw_mode: 白黒マスク出力モード (True: 対象物=白, 背景=黒)
-        shadow_mode: 影マスク出力モード (True: 影を別ファイルで出力)
-        shadow_threshold: 影検出の輝度閾値 (0-255)
+        shadow_threshold: 影検出の輝度閾値 (0-255) - shadowが対象物に含まれる場合に使用
     """
     try:
         filename = os.path.basename(image_path)
@@ -250,14 +250,10 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
         else:
             save_path = os.path.join(output_dir, name + ext)
 
-        # 影マスクの保存パス
-        shadow_save_path = os.path.join(output_dir, name + "_shadow.png")
-
         # 既存ファイルチェック
         if os.path.exists(save_path):
-            if not shadow_mode or os.path.exists(shadow_save_path):
-                print(f"既にファイルが存在したのでスキップ: {filename}")
-                return False
+            print(f"既にファイルが存在したのでスキップ: {filename}")
+            return False
 
         original_image = Image.open(image_path).convert("RGBA")
         image_input = original_image.convert("RGB")
@@ -302,6 +298,41 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
         unique_labels = np.unique(pred_np)
 
         # =========================================================
+        # 人の影を検出 (shadowが対象物に含まれている場合)
+        # =========================================================
+        shadow_detected = np.zeros((H, W), dtype=bool)
+        if "shadow" in TARGET_COLORS:
+            # 人物マスクを作成
+            person_mask = np.zeros((H, W), dtype=bool)
+            for label_id in unique_labels:
+                if label_id in id2label and id2label[label_id].lower() == "person":
+                    person_mask |= (pred_np == label_id)
+
+            # 地面マスクを作成
+            ground_mask = np.zeros((H, W), dtype=bool)
+            for label_id in unique_labels:
+                if label_id in id2label and id2label[label_id].lower() in GROUND_CLASSES:
+                    ground_mask |= (pred_np == label_id)
+
+            if np.any(person_mask) and np.any(ground_mask):
+                # 人物の周囲を拡張
+                person_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (150, 150))
+                person_area = cv2.dilate(person_mask.astype(np.uint8) * 255, person_dilate_kernel, iterations=1) > 127
+
+                # グレースケールで輝度取得
+                gray = np.array(image_input.convert("L"))
+
+                # 人の影 = 地面 & 人物の近く & 暗い & 人物本体ではない
+                shadow_detected = (gray < shadow_threshold) & ground_mask & person_area & (~person_mask)
+
+                # ノイズ除去
+                morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                shadow_uint8 = shadow_detected.astype(np.uint8) * 255
+                shadow_uint8 = cv2.morphologyEx(shadow_uint8, cv2.MORPH_CLOSE, morph_kernel)
+                shadow_uint8 = cv2.morphologyEx(shadow_uint8, cv2.MORPH_OPEN, morph_kernel)
+                shadow_detected = shadow_uint8 > 127
+
+        # =========================================================
         # 白黒マスク出力モード
         # =========================================================
         if bw_mode:
@@ -329,6 +360,20 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
                     mask = mask_uint8 > 127
 
                 bw_result[mask] = 255
+
+            # 影マスクを適用 (shadowが対象物に含まれている場合)
+            if "shadow" in TARGET_COLORS and np.any(shadow_detected):
+                _, _, _, _, exp = TARGET_COLORS["shadow"]
+                if exp != 0:
+                    shadow_mask_uint8 = shadow_detected.astype(np.uint8) * 255
+                    kernel_size = 2 * abs(exp) + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                    if exp > 0:
+                        shadow_mask_uint8 = cv2.dilate(shadow_mask_uint8, kernel, iterations=1)
+                    else:
+                        shadow_mask_uint8 = cv2.erode(shadow_mask_uint8, kernel, iterations=1)
+                    shadow_detected = shadow_mask_uint8 > 127
+                bw_result[shadow_detected] = 255
 
             # 白黒マスクを保存 (常にPNG)
             Image.fromarray(bw_result, "L").save(save_path)
@@ -362,6 +407,21 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
                 mask_arr[mask] = (r, g, b, a)
                 found_mask[mask] = True
 
+            # 影マスクを適用 (shadowが対象物に含まれている場合)
+            if "shadow" in TARGET_COLORS and np.any(shadow_detected):
+                r, g, b, a, exp = TARGET_COLORS["shadow"]
+                if exp != 0:
+                    shadow_mask_uint8 = shadow_detected.astype(np.uint8) * 255
+                    kernel_size = 2 * abs(exp) + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                    if exp > 0:
+                        shadow_mask_uint8 = cv2.dilate(shadow_mask_uint8, kernel, iterations=1)
+                    else:
+                        shadow_mask_uint8 = cv2.erode(shadow_mask_uint8, kernel, iterations=1)
+                    shadow_detected = shadow_mask_uint8 > 127
+                mask_arr[shadow_detected] = (r, g, b, a)
+                found_mask[shadow_detected] = True
+
             final_np = np.array(original_image, dtype=np.uint8)
             final_np[found_mask] = mask_arr[found_mask]
 
@@ -376,53 +436,6 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
 
             print(f"完了: {filename}")
 
-        # =========================================================
-        # 影マスク出力モード (人の影のみ)
-        # =========================================================
-        if shadow_mode:
-            # 人物クラスのマスクを作成
-            person_mask = np.zeros((H, W), dtype=bool)
-            for label_id in unique_labels:
-                if label_id not in id2label:
-                    continue
-                name_lbl = id2label[label_id].lower()
-                if name_lbl == "person":
-                    person_mask |= (pred_np == label_id)
-
-            # 地面クラスのマスクを作成
-            ground_mask = np.zeros((H, W), dtype=bool)
-            for label_id in unique_labels:
-                if label_id not in id2label:
-                    continue
-                name_lbl = id2label[label_id].lower()
-                if name_lbl in GROUND_CLASSES:
-                    ground_mask |= (pred_np == label_id)
-
-            if not np.any(person_mask):
-                print(f"影マスク: 人物が検出されませんでした: {filename}")
-            elif not np.any(ground_mask):
-                print(f"影マスク: 地面クラスが検出されませんでした: {filename}")
-            else:
-                # 人物マスクを大きく拡張して影の検索範囲を作成
-                person_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (150, 150))
-                person_area = cv2.dilate(person_mask.astype(np.uint8) * 255, person_dilate_kernel, iterations=1) > 127
-
-                # グレースケールに変換して輝度を取得
-                gray = np.array(image_input.convert("L"))
-
-                # 地面領域内 & 人物の近く & 暗い部分 = 人の影
-                shadow_mask = (gray < shadow_threshold) & ground_mask & person_area & (~person_mask)
-
-                # モルフォロジー処理でノイズ除去
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                shadow_mask_uint8 = shadow_mask.astype(np.uint8) * 255
-                shadow_mask_uint8 = cv2.morphologyEx(shadow_mask_uint8, cv2.MORPH_CLOSE, kernel)
-                shadow_mask_uint8 = cv2.morphologyEx(shadow_mask_uint8, cv2.MORPH_OPEN, kernel)
-
-                # 影マスクを保存
-                Image.fromarray(shadow_mask_uint8, "L").save(shadow_save_path)
-                print(f"影マスク完了: {filename} -> {os.path.basename(shadow_save_path)}")
-
         return True
 
     except Exception as e:
@@ -436,7 +449,7 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
 #  全画像処理
 # =========================================================
 def start_processing(input_folder, output_folder, target_colors, inf_short, inf_long,
-                     stop_event, save_format, bw_mode=False, shadow_mode=False, shadow_threshold=100):
+                     stop_event, save_format, bw_mode=False, shadow_threshold=100):
     if not os.path.exists(input_folder):
         print("入力フォルダが存在しません")
         return
@@ -454,7 +467,7 @@ def start_processing(input_folder, output_folder, target_colors, inf_short, inf_
     print(f"推論解像度 基準={inf_short}[px], 上限={inf_long}[px]")
     if bw_mode:
         print("モード: 白黒マスク出力 (3DGS用)")
-    if shadow_mode:
+    if "shadow" in target_colors:
         print(f"モード: 影検出有効 (閾値={shadow_threshold})")
 
     processor, model = load_model(inf_short, inf_long)
@@ -474,7 +487,7 @@ def start_processing(input_folder, output_folder, target_colors, inf_short, inf_
             break
 
         apply_segmentation(f, processor, model, output_folder, target_colors, save_format,
-                           bw_mode, shadow_mode, shadow_threshold)
+                           bw_mode, shadow_threshold)
 
         elapsed = time.time() - start
         if i + 1 > 0:
@@ -540,18 +553,14 @@ class SegGUI:
         ttk.Checkbutton(frm_mode, text="白黒マスク出力 (対象物=白, 背景=黒, PNG形式, ファイル名に _mask 追加)",
                         variable=self.bw_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=2)
 
-        # 影検出モード
-        self.shadow_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm_mode, text="影マスク出力 (地面の暗い領域を検出, ファイル名に _shadow 追加)",
-                        variable=self.shadow_var).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=2)
-
-        # 影検出閾値スライダー
+        # 影検出閾値スライダー (対象物に「shadow」を追加すると有効)
         self.thresh_var = tk.IntVar(value=100)
-        ttk.Label(frm_mode, text="影検出の輝度閾値 (0-255): ").grid(row=2, column=0, sticky="w", padx=5)
+        ttk.Label(frm_mode, text="影検出の輝度閾値 (0-255): ").grid(row=1, column=0, sticky="w", padx=5)
         thresh_scale = ttk.Scale(frm_mode, from_=0, to=255, variable=self.thresh_var, orient="horizontal", length=200)
-        thresh_scale.grid(row=2, column=1, padx=5, pady=2)
+        thresh_scale.grid(row=1, column=1, padx=5, pady=2)
         self.thresh_label = ttk.Label(frm_mode, text="100")
-        self.thresh_label.grid(row=2, column=2, sticky="w")
+        self.thresh_label.grid(row=1, column=2, sticky="w")
+        ttk.Label(frm_mode, text="※対象物に「shadow」を追加すると人の影を検出します").grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=2)
 
         def update_thresh_label(*args):
             self.thresh_label.config(text=str(self.thresh_var.get()))
@@ -770,7 +779,6 @@ class SegGUI:
             "long": self.long_var.get(),
             "format": self.format_var.get(),
             "bw_mode": self.bw_var.get(),
-            "shadow_mode": self.shadow_var.get(),
             "shadow_threshold": self.thresh_var.get(),
             "table": [
                 [e.get() for e in row] for row in self.cells
@@ -795,7 +803,6 @@ class SegGUI:
             self.long_var.set(data.get("long", 2048))
             self.format_var.set(data.get("format", "png"))
             self.bw_var.set(data.get("bw_mode", False))
-            self.shadow_var.set(data.get("shadow_mode", False))
             self.thresh_var.set(data.get("shadow_threshold", 100))
             table_data = data.get("table", [])
 
@@ -860,7 +867,6 @@ class SegGUI:
                 self.stop_event,
                 self.format_var.get(),
                 self.bw_var.get(),
-                self.shadow_var.get(),
                 self.thresh_var.get(),
             ),
             daemon=True,
