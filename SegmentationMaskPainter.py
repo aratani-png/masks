@@ -377,9 +377,18 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
             print(f"完了: {filename}")
 
         # =========================================================
-        # 影マスク出力モード
+        # 影マスク出力モード (人の影のみ)
         # =========================================================
         if shadow_mode:
+            # 人物クラスのマスクを作成
+            person_mask = np.zeros((H, W), dtype=bool)
+            for label_id in unique_labels:
+                if label_id not in id2label:
+                    continue
+                name_lbl = id2label[label_id].lower()
+                if name_lbl == "person":
+                    person_mask |= (pred_np == label_id)
+
             # 地面クラスのマスクを作成
             ground_mask = np.zeros((H, W), dtype=bool)
             for label_id in unique_labels:
@@ -389,12 +398,20 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
                 if name_lbl in GROUND_CLASSES:
                     ground_mask |= (pred_np == label_id)
 
-            if np.any(ground_mask):
+            if not np.any(person_mask):
+                print(f"影マスク: 人物が検出されませんでした: {filename}")
+            elif not np.any(ground_mask):
+                print(f"影マスク: 地面クラスが検出されませんでした: {filename}")
+            else:
+                # 人物マスクを大きく拡張して影の検索範囲を作成
+                person_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (150, 150))
+                person_area = cv2.dilate(person_mask.astype(np.uint8) * 255, person_dilate_kernel, iterations=1) > 127
+
                 # グレースケールに変換して輝度を取得
                 gray = np.array(image_input.convert("L"))
 
-                # 地面領域内で暗い部分を影として検出
-                shadow_mask = (gray < shadow_threshold) & ground_mask
+                # 地面領域内 & 人物の近く & 暗い部分 = 人の影
+                shadow_mask = (gray < shadow_threshold) & ground_mask & person_area & (~person_mask)
 
                 # モルフォロジー処理でノイズ除去
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -405,8 +422,6 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
                 # 影マスクを保存
                 Image.fromarray(shadow_mask_uint8, "L").save(shadow_save_path)
                 print(f"影マスク完了: {filename} -> {os.path.basename(shadow_save_path)}")
-            else:
-                print(f"影マスク: 地面クラスが検出されませんでした: {filename}")
 
         return True
 

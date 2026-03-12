@@ -32,8 +32,8 @@ pip install torch torchvision numpy pillow opencv-python transformers
 - 背景 = 黒 (0)
 - ファイル名: `*_mask.png`
 
-### 影マスク出力
-- 地面の暗い領域を影として検出
+### 影マスク出力 (人の影のみ)
+- 人物の近くにある地面の暗い領域を影として検出
 - 輝度閾値で調整可能 (0-255)
 - ファイル名: `*_shadow.png`
 
