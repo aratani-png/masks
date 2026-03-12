@@ -1,6 +1,12 @@
 # ==============================================================================================================
 # 作成者:dimebag29 作成日:2025年12月12日 バージョン:v0.4
+# 改造: aratani-png 改造日:2026年3月 バージョン:v0.5-mod
 # (Author:dimebag29 Creation date:December 12, 2025 Version:v0.4)
+# (Modified by: aratani-png, March 2026, Version:v0.5-mod)
+#
+# 改造内容:
+# - 白黒マスク出力モード追加 (3DGS用: 対象物=白, 背景=黒)
+# - 影検出マスク出力追加 (地面の暗い領域を検出)
 #
 # このプログラムは大部分をAI (Gemini 3.0 Pro, ChatGPT 5.1)を利用して作成されました。
 # (This program was created largely using AI (Gemini 3.0 Pro, ChatGPT 5.1). )
@@ -76,6 +82,11 @@ from PIL import Image                                                           
 import cv2                                                                          # 4.12.0.88
 from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation    # 4.57.3
 
+
+# =========================================================
+#  影検出用の地面クラス
+# =========================================================
+GROUND_CLASSES = ["floor", "road", "sidewalk", "earth", "grass", "path", "field", "sand", "rug"]
 
 # =========================================================
 #  対象物名(クラス名)データ
@@ -216,16 +227,35 @@ def load_model(inf_short, inf_long):
         return None, None
 
 
-def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, save_format):
+def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, save_format,
+                       bw_mode=False, shadow_mode=False, shadow_threshold=100):
+    """
+    セグメンテーション処理
+
+    Args:
+        bw_mode: 白黒マスク出力モード (True: 対象物=白, 背景=黒)
+        shadow_mode: 影マスク出力モード (True: 影を別ファイルで出力)
+        shadow_threshold: 影検出の輝度閾値 (0-255)
+    """
     try:
         filename = os.path.basename(image_path)
         name, _ = os.path.splitext(filename)
         ext = ".png" if save_format == "png" else ".jpg"
-        save_path = os.path.join(output_dir, name + ext)
 
+        # 白黒モードの場合は _mask サフィックスを追加
+        if bw_mode:
+            save_path = os.path.join(output_dir, name + "_mask.png")
+        else:
+            save_path = os.path.join(output_dir, name + ext)
+
+        # 影マスクの保存パス
+        shadow_save_path = os.path.join(output_dir, name + "_shadow.png")
+
+        # 既存ファイルチェック
         if os.path.exists(save_path):
-            print(f"既にファイルが存在したのでスキップ: {filename}")
-            return False
+            if not shadow_mode or os.path.exists(shadow_save_path):
+                print(f"既にファイルが存在したのでスキップ: {filename}")
+                return False
 
         original_image = Image.open(image_path).convert("RGBA")
         image_input = original_image.convert("RGB")
@@ -269,49 +299,113 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
         id2label = getattr(model.config, "id2label", {i: f"class_{i}" for i in range(150)})
         unique_labels = np.unique(pred_np)
 
-        # === マスク処理 ===
-        for label_id in unique_labels:
-            if label_id not in id2label:
-                continue
+        # =========================================================
+        # 白黒マスク出力モード
+        # =========================================================
+        if bw_mode:
+            bw_result = np.zeros((H, W), dtype=np.uint8)
 
-            name_lbl = id2label[label_id].lower()
-            if name_lbl not in TARGET_COLORS:
-                continue
+            for label_id in unique_labels:
+                if label_id not in id2label:
+                    continue
+                name_lbl = id2label[label_id].lower()
+                if name_lbl not in TARGET_COLORS:
+                    continue
 
-            r, g, b, a, exp = TARGET_COLORS[name_lbl]
+                _, _, _, _, exp = TARGET_COLORS[name_lbl]
+                mask = (pred_np == label_id)
 
-            mask = (pred_np == label_id)
+                # マスク拡張・縮小処理
+                if exp != 0:
+                    mask_uint8 = mask.astype(np.uint8) * 255
+                    kernel_size = 2 * abs(exp) + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                    if exp > 0:
+                        mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=1)
+                    else:
+                        mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=1)
+                    mask = mask_uint8 > 127
 
-            # マスク拡張・縮小処理
-            if exp != 0:
-                mask_uint8 = mask.astype(np.uint8) * 255
-                kernel_size = 2 * abs(exp) + 1
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                bw_result[mask] = 255
 
-                if exp > 0:
-                    mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=1)
-                else:
-                    mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=1)
-                
-                mask = mask_uint8 > 127
+            # 白黒マスクを保存 (常にPNG)
+            Image.fromarray(bw_result, "L").save(save_path)
+            print(f"白黒マスク完了: {filename} -> {os.path.basename(save_path)}")
 
-            mask_arr[mask] = (r, g, b, a)
-            found_mask[mask] = True
-
-        # === 画像生成と保存 ===
-        final_np = np.array(original_image, dtype=np.uint8)
-        final_np[found_mask] = mask_arr[found_mask]
-
-        exif_data = original_image.getexif()
-        merged_image = Image.fromarray(final_np, "RGBA")
-
-        if save_format == "jpg":
-            merged_image = merged_image.convert("RGB")
-            merged_image.save(save_path, quality=95, exif=exif_data)
+        # =========================================================
+        # 通常モード (カラーマスク)
+        # =========================================================
         else:
-            merged_image.save(save_path, exif=exif_data)
+            for label_id in unique_labels:
+                if label_id not in id2label:
+                    continue
 
-        print(f"完了: {filename}")
+                name_lbl = id2label[label_id].lower()
+                if name_lbl not in TARGET_COLORS:
+                    continue
+
+                r, g, b, a, exp = TARGET_COLORS[name_lbl]
+                mask = (pred_np == label_id)
+
+                if exp != 0:
+                    mask_uint8 = mask.astype(np.uint8) * 255
+                    kernel_size = 2 * abs(exp) + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                    if exp > 0:
+                        mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=1)
+                    else:
+                        mask_uint8 = cv2.erode(mask_uint8, kernel, iterations=1)
+                    mask = mask_uint8 > 127
+
+                mask_arr[mask] = (r, g, b, a)
+                found_mask[mask] = True
+
+            final_np = np.array(original_image, dtype=np.uint8)
+            final_np[found_mask] = mask_arr[found_mask]
+
+            exif_data = original_image.getexif()
+            merged_image = Image.fromarray(final_np, "RGBA")
+
+            if save_format == "jpg":
+                merged_image = merged_image.convert("RGB")
+                merged_image.save(save_path, quality=95, exif=exif_data)
+            else:
+                merged_image.save(save_path, exif=exif_data)
+
+            print(f"完了: {filename}")
+
+        # =========================================================
+        # 影マスク出力モード
+        # =========================================================
+        if shadow_mode:
+            # 地面クラスのマスクを作成
+            ground_mask = np.zeros((H, W), dtype=bool)
+            for label_id in unique_labels:
+                if label_id not in id2label:
+                    continue
+                name_lbl = id2label[label_id].lower()
+                if name_lbl in GROUND_CLASSES:
+                    ground_mask |= (pred_np == label_id)
+
+            if np.any(ground_mask):
+                # グレースケールに変換して輝度を取得
+                gray = np.array(image_input.convert("L"))
+
+                # 地面領域内で暗い部分を影として検出
+                shadow_mask = (gray < shadow_threshold) & ground_mask
+
+                # モルフォロジー処理でノイズ除去
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                shadow_mask_uint8 = shadow_mask.astype(np.uint8) * 255
+                shadow_mask_uint8 = cv2.morphologyEx(shadow_mask_uint8, cv2.MORPH_CLOSE, kernel)
+                shadow_mask_uint8 = cv2.morphologyEx(shadow_mask_uint8, cv2.MORPH_OPEN, kernel)
+
+                # 影マスクを保存
+                Image.fromarray(shadow_mask_uint8, "L").save(shadow_save_path)
+                print(f"影マスク完了: {filename} -> {os.path.basename(shadow_save_path)}")
+            else:
+                print(f"影マスク: 地面クラスが検出されませんでした: {filename}")
+
         return True
 
     except Exception as e:
@@ -324,7 +418,8 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
 # =========================================================
 #  全画像処理
 # =========================================================
-def start_processing(input_folder, output_folder, target_colors, inf_short, inf_long, stop_event, save_format):
+def start_processing(input_folder, output_folder, target_colors, inf_short, inf_long,
+                     stop_event, save_format, bw_mode=False, shadow_mode=False, shadow_threshold=100):
     if not os.path.exists(input_folder):
         print("入力フォルダが存在しません")
         return
@@ -340,6 +435,10 @@ def start_processing(input_folder, output_folder, target_colors, inf_short, inf_
         return
 
     print(f"推論解像度 基準={inf_short}[px], 上限={inf_long}[px]")
+    if bw_mode:
+        print("モード: 白黒マスク出力 (3DGS用)")
+    if shadow_mode:
+        print(f"モード: 影検出有効 (閾値={shadow_threshold})")
 
     processor, model = load_model(inf_short, inf_long)
     if processor is None:
@@ -357,7 +456,8 @@ def start_processing(input_folder, output_folder, target_colors, inf_short, inf_
             print("\n>>> ユーザー操作により処理を中断しました <<<\n")
             break
 
-        apply_segmentation(f, processor, model, output_folder, target_colors, save_format)
+        apply_segmentation(f, processor, model, output_folder, target_colors, save_format,
+                           bw_mode, shadow_mode, shadow_threshold)
 
         elapsed = time.time() - start
         if i + 1 > 0:
@@ -375,7 +475,7 @@ def start_processing(input_folder, output_folder, target_colors, inf_short, inf_
 class SegGUI:
     def __init__(self, root):
         self.root = root
-        root.title("SegmentationMaskPainter v0.4")
+        root.title("SegmentationMaskPainter v0.5-mod (白黒マスク＆影検出対応)")
         
         # 中断制御用のイベント
         self.stop_event = threading.Event()
@@ -411,6 +511,34 @@ class SegGUI:
 
         ttk.Label(frm_res, text="上限 [px] (初期値:2048) ").grid(row=1, column=0, sticky="w")
         ttk.Entry(frm_res, textvariable=self.long_var, width=10).grid(row=1, column=1)
+
+        # ==============================
+        # 新機能: 白黒マスク＆影検出
+        # ==============================
+        frm_mode = ttk.LabelFrame(root, text="出力モード設定 (3DGS/影検出)")
+        frm_mode.pack(fill="x", padx=10, pady=5)
+
+        # 白黒マスクモード
+        self.bw_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_mode, text="白黒マスク出力 (対象物=白, 背景=黒, PNG形式, ファイル名に _mask 追加)",
+                        variable=self.bw_var).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+
+        # 影検出モード
+        self.shadow_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm_mode, text="影マスク出力 (地面の暗い領域を検出, ファイル名に _shadow 追加)",
+                        variable=self.shadow_var).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+
+        # 影検出閾値スライダー
+        self.thresh_var = tk.IntVar(value=100)
+        ttk.Label(frm_mode, text="影検出の輝度閾値 (0-255): ").grid(row=2, column=0, sticky="w", padx=5)
+        thresh_scale = ttk.Scale(frm_mode, from_=0, to=255, variable=self.thresh_var, orient="horizontal", length=200)
+        thresh_scale.grid(row=2, column=1, padx=5, pady=2)
+        self.thresh_label = ttk.Label(frm_mode, text="100")
+        self.thresh_label.grid(row=2, column=2, sticky="w")
+
+        def update_thresh_label(*args):
+            self.thresh_label.config(text=str(self.thresh_var.get()))
+        self.thresh_var.trace("w", update_thresh_label)
 
         # ==============================
         # マスク設定 入力欄
@@ -624,6 +752,9 @@ class SegGUI:
             "short": self.short_var.get(),
             "long": self.long_var.get(),
             "format": self.format_var.get(),
+            "bw_mode": self.bw_var.get(),
+            "shadow_mode": self.shadow_var.get(),
+            "shadow_threshold": self.thresh_var.get(),
             "table": [
                 [e.get() for e in row] for row in self.cells
             ],
@@ -635,7 +766,7 @@ class SegGUI:
     # ---------------------------------------------------------
     def load_saved_settings(self):
         data = load_settings()
-        
+
         if not data:
             print("設定履歴がありません。デフォルト値を適用します。")
             table_data = DEFAULT_TARGETS
@@ -646,6 +777,9 @@ class SegGUI:
             self.short_var.set(data.get("short", 1024))
             self.long_var.set(data.get("long", 2048))
             self.format_var.set(data.get("format", "png"))
+            self.bw_var.set(data.get("bw_mode", False))
+            self.shadow_var.set(data.get("shadow_mode", False))
+            self.thresh_var.set(data.get("shadow_threshold", 100))
             table_data = data.get("table", [])
 
         # テーブルデータの流し込み
@@ -708,6 +842,9 @@ class SegGUI:
                 long_val,
                 self.stop_event,
                 self.format_var.get(),
+                self.bw_var.get(),
+                self.shadow_var.get(),
+                self.thresh_var.get(),
             ),
             daemon=True,
         ).start()
