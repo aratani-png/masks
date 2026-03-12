@@ -244,9 +244,9 @@ def apply_segmentation(image_path, processor, model, output_dir, TARGET_COLORS, 
         name, _ = os.path.splitext(filename)
         ext = ".png" if save_format == "png" else ".jpg"
 
-        # 白黒モードの場合は _mask サフィックスを追加
+        # 白黒モードは常にPNG、通常モードは選択した形式
         if bw_mode:
-            save_path = os.path.join(output_dir, name + "_mask.png")
+            save_path = os.path.join(output_dir, name + ".png")
         else:
             save_path = os.path.join(output_dir, name + ext)
 

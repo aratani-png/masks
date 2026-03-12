@@ -30,7 +30,7 @@ pip install torch torchvision numpy pillow opencv-python transformers
 ### 白黒マスク出力 (3DGS用)
 - 対象物 = 白 (255)
 - 背景 = 黒 (0)
-- ファイル名: `*_mask.png`
+- 入力と同じファイル名で出力 (PNG形式)
 
 ### 人の影検出 (shadowクラス)
 - 対象物一覧から「shadow」を選択して使用
